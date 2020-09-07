@@ -1,1 +1,1 @@
-import wire
+import wire numpy
