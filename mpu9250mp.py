@@ -17,10 +17,13 @@ class MPU9250:
             print("Couldn't find the device under the provided address! Please check wiring.")
     
     #returns byte array pulled from register
-    def byteRead(self,regAddr,size): #register name form datasheet, register size in bytes
+    def byteRead(self,regAddr,size=1): #register name form datasheet, register size in bytes
         self.regAddr = regAddr
         self.size = size
-        return self.i2c.readfrom_mem(self.address,addrDict[regAddr],size)
+        if type(regAddr) == type(''): #check if input is string
+            return self.i2c.readfrom_mem(self.address,addrDict[regAddr],size)
+        elif type(regAddr) == type(1): #check if input is int
+            return self.i2c.readfrom_mem(self.address,regAddr,size)
 
     #returns int value represented by 16 bit register (two complement signed value)
     def read16bitSigned(self,regAddr,swap=False): #register name form datasheet, bytes swaped, set True if yes
@@ -35,7 +38,7 @@ class MPU9250:
             buff = -((buff^0xFFFF)+1)
         return buff
 
-    #returns string of bits from byte
+    #returns string of bits from byte, useful while checking setting on the register
     def binRead(self,regAddr): #register name form datasheet
         self.regAddr = regAddr
         return bin(self.i2c.readfrom_mem(self.address,addrDict[regAddr],1)[0])
@@ -44,8 +47,13 @@ class MPU9250:
     def byteWrite(self,regAddr,buff):
         self.regAddr = regAddr
         self.buff = buff
-        self.i2c.writeto_mem(self.address,addrDict[regAddr],bytes([buff]))
-        if self.byteRead(regAddr,1) == bytes([buff]):
+        if type(regAddr) == type(''):
+            self.i2c.writeto_mem(self.address,addrDict[regAddr],bytes([buff]))
+        elif type(regAddr) == type(1):
+            self.i2c.writeto_mem(self.address,regAddr,bytes([buff]))
+        else:
+            print('Wrong value type for register address!')
+        if self.byteRead(regAddr) == bytes([buff]):
             return True
         else:
             return False
@@ -100,10 +108,60 @@ class MPU9250:
         #set accel_fchoice_b to 0 to activate accel DLPF
         self.byteWrite('ACCEL_CONFIG_2',0x00 | setting)
 
+    #self test procedure for accel and gyro
+    def selfTest(self):
+        self.setDLPF(2)
+        self.setAccelDLPF(2)
+        self.setGyroRange(250)
+        self.setAccelRange(2)
+        data = [0]*6
+        for counter in range(0,199):#aquire 200 readings of gyro and accel
+            for index in range(0,3):#loop through index of data
+                data[index]+=self.byteRead(addrDict['ACCEL_XOUT_L']+2*index)[0]
+                data[index+3]+=self.byteRead(addrDict['GYRO_XOUT_L']+2*index)[0]
+        for index in range(0,len(data)):
+            data[index] = data[index]/200
+        #set gyro and accel into self test mode
+        self.byteWrite('GYRO_CONFIG',0b11100000)
+        self.byteWrite('ACCEL_CONFIG',0b11100000)
+        sleep_ms(20) #wait for oscillators to stabilize
+        datast = [0]*6
+        for counter in range(0,199):#aquire 200 readings of gyro and accel in self test mode
+            for index in range(0,3):#loop through index of datast
+                datast[index]+=self.byteRead(addrDict['ACCEL_XOUT_L']+2*index)[0]
+                datast[index+3]+=self.byteRead(addrDict['GYRO_XOUT_L']+2*index)[0]
+        for index in range(0,len(datast)):
+            datast[index] = datast[index]/200
+        #set sensors back to normal mode from self test mode
+        self.byteWrite('GYRO_CONFIG',0)
+        self.byteWrite('ACCEL_CONFIG',0)
+        self.setAccelDLPF(0)
+        self.setDLPF(0)
+        sleep_ms(20)
+        #calculate self test response
+        for index in range(0,len(data)):
+            datast[index] = datast[index] - data[index]
+        #read factory self test values
+        ST_code = [0]*6
+        for index in range(0,len(ST_code)):
+            if index <= 2:
+                ST_code[index] = self.byteRead(addrDict['SELF_TEST_X_GYRO']+index)[0]
+            else:
+                ST_code[index] = self.byteRead(addrDict['SELF_TEST_X_ACCEL']+index-3)[0]
+        #calculate factory trim
+        ST_OTP = [0]*6
+        for index in range(0,len(ST_OTP)):
+            ST_OTP[index] = 2620*pow(1.01,(ST_code[index]-1))
+            data[index] = 100*datast[index]/ST_OTP[index]
+            if abs(round(data[index],0))>10:
+                print('Sensor failed on index '+str(index)+' in [ax, ay, az, gx, gy, gz] matrix')
+                return False
+        return True #return True if sensor passed the selfTest
+
     #read temperature in oC
     def readTemp(self):
         temp = self.read16bitSigned('TEMP_OUT_H') #put only higher address, method takes 2 bytes
-        #conversion from LSB to oC
+        #conversion from raw data to oC
         temp = (temp-1/333.87)+21
         return temp
 
@@ -115,7 +173,7 @@ class MPU9250:
     #returns list with normalized readings from accelerometer - unit [G]
     def readAccel(self):
         #read accel setting to normalize value
-        setting = (self.byteRead('ACCEL_CONFIG',1)[0] >> 3) & 0b00000011
+        setting = (self.byteRead('ACCEL_CONFIG')[0] >> 3)
         if setting == 3:
             setting = 16
         elif setting == 2:
@@ -138,7 +196,7 @@ class MPU9250:
     #returns list with normalized gyro readings - unit [DPS]
     def readGyro(self):
         #read gyro setting to normalize value
-        setting = (self.byteRead('GYRO_CONFIG',1)[0] >> 3) & 0b00000011
+        setting = (self.byteRead('GYRO_CONFIG')[0] >> 3)
         if setting == 3:
             sensitivity = 16.4
             setting = 2000
@@ -157,22 +215,47 @@ class MPU9250:
             data[index] = 2*setting*((data[index]/sensitivity)-(-32768))/(32767-(-32768))-setting
         return data
 
-    #set magnetometer with bypass mode
+    #set magnetometer with bypass mode, if it passes self test return True
     def setMag(self):
         self.byteWrite('USER_CTRL',0) #disable i2c master mode
         self.byteWrite('INT_PIN_CFG',0b00000010) #enable bypass mode
-        sleep_ms(100)
-        self.i2c.writeto_mem(addrDict['MAG_ADDRESS'],addrDict['CTRL'],bytes([0b00010010])) #set magnetometer to send 16 bit values in 8Hz period(continous mode 1)
+        #self test sequence for magnetometer
+        sleep_ms(50)
+        self.i2c.writeto_mem(addrDict['MAG_ADDRESS'],addrDict['CTRL'],bytes([0])) #set power down mode
+        sleep_ms(50)
+        self.i2c.writeto_mem(addrDict['MAG_ADDRESS'],addrDict['ASTC'],bytes([0b01000000])) #set magnetometr in to selftestmode
+        sleep_ms(50)
+        self.i2c.writeto_mem(addrDict['MAG_ADDRESS'],addrDict['CTRL'],bytes([0b00011000])) #set magnetometr in to selftestmode, 16 bit output
+        sleep_ms(50)
+        if(self.i2c.readfrom_mem(addrDict['MAG_ADDRESS'],addrDict['ST1'],1)[0] == 1): #check DRDY pin
+            for address in range(0x03,0x07,2):
+                data = self.i2c.readfrom_mem(addrDict['MAG_ADDRESS'],address,2)
+                data = data[1] << 8 | data[0]
+                if data & 0x8000:
+                    data = -((data^0xFFFF)+1)
+                if address == 0x03 | address == 0x05:
+                    if data<=-200 & data>=200:
+                        print("Magnetometer did not pass self test on axis X or Y")
+                        return
+                elif address == 0x07:
+                    if data<=-3200 & data>=-800:
+                        print("Magnetometer did not pass self test on axis Z")
+                        return
+        sleep_ms(50)
+        self.i2c.writeto_mem(addrDict['MAG_ADDRESS'],addrDict['ASTC'],bytes([0]))#set self test control register back to default
+        self.i2c.writeto_mem(addrDict['MAG_ADDRESS'],addrDict['CTRL'],bytes([0b00010110])) #set magnetometer to send 16 bit values in 8Hz period(continous mode 1)
         #read sensitivity adjustment coefficients
         self.ASAX = self.i2c.readfrom_mem(addrDict['MAG_ADDRESS'],addrDict['ASAX'],1)[0]
         self.ASAY = self.i2c.readfrom_mem(addrDict['MAG_ADDRESS'],addrDict['ASAY'],1)[0]
         self.ASAZ = self.i2c.readfrom_mem(addrDict['MAG_ADDRESS'],addrDict['ASAZ'],1)[0]
         self.byteWrite('INT_PIN_CFG',0) #disable bypass mode
+        #use external slave 0 to read data from magnetometer
         self.byteWrite('I2C_MST_CTRL',0b01000000) #enable i2c master mode
         self.byteWrite('USER_CTRL',0b00100000) #enable wait for data to write to external sensor data register
         self.byteWrite('I2C_SLV0_ADDR',0b10000000 | addrDict['MAG_ADDRESS']) #set slave 0 in read mode with magnetometer address
         self.byteWrite('I2C_SLV0_REG',0x03) #set starting address to read from magnetometer
         self.byteWrite('I2C_SLV0_CTRL',0b10000111) #enable i2c slave 0, pull 7 bytes
+        return True
 
     #read raw data from magnetometer
     def readMagRaw(self):
@@ -185,5 +268,36 @@ class MPU9250:
         data = self.readMagRaw()
         for index in range(0, len(data)):
             #normalize in range of magnetometer maximum range
-            data[index] = 2*setting*((data[index])-(-32768))/(32767-(-32768))-setting
+            data[index] = 2*setting*((data[index])-(-32760))/(32760-(-32760))-setting
         return data
+
+    def calibrate(self):
+        print('Leave sensor leveled without motion for calibration!')
+        sleep_ms(2000)
+        self.setAccelRange(16)
+        self.setAccelDLPF(4)
+        self.setGyroRange(250)
+        self.setDLPF(4)
+        data = [0]*6
+        for counter in range(0,199):#aquire 200 readings of gyro and accel
+            for index in range(0,3):#loop through index of data
+                data[index]+=self.byteRead(addrDict['ACCEL_XOUT_L']+2*index)[0]
+                data[index+3]+=self.byteRead(addrDict['GYRO_XOUT_L']+2*index)[0]
+        for index in range(0,len(data)):
+            data[index] = data[index]/200
+        #find axis parallell to g force vector
+        index = index(max(data,key=abs))
+        if data[index]>0:
+            data[index] = data[index]-9.81
+        else:
+            data[index] = data[index]+9.81
+        #calculate gyro offsets with gyroo sensitivity
+        sensitivity = 131 #range is 250[DPS]
+        for index in range(3,len(data)):
+            data[index] = data[index]*sensitivity/4
+        print('Calibration offests [ax, ay, az, gx, gy, gz] '+str(data))
+        #set offests
+        for index in range(0,3):
+            self.byteWrite(addrDict['XA_OFFSET_H']+2*index,data[index])
+            self.byteWrite(addrDict['XG_OFFSET_H']+2*index,data[index+3])
+        print('Calibration done')
